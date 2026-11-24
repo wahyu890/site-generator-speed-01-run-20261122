@@ -103,10 +103,21 @@ function uniqueSlug(slug, taken) {
   return out;
 }
 
-/** The words of a body: its runs of characters other than whitespace. */
-function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+// Every code unit JavaScript's \s matches, by table: the word count of a
+// line is its runs of characters other than these.
+const WS = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) WS[c] = 1;
+for (let c = 0x2000; c <= 0x200a; c++) WS[c] = 1;
+
+/** The words of a whole body: its runs of characters other than whitespace. */
+function countWords(body) {
+  let n = 0;
+  let inW = false;
+  for (let i = 0; i < body.length; i++) {
+    if (WS[body.charCodeAt(i)] === 1) inW = false;
+    else if (!inW) { inW = true; n++; }
+  }
+  return n;
 }
 
 /** Whether `line` is blank (spaces and tabs only). */
@@ -124,7 +135,7 @@ function trimST(s) {
   let b = s.length;
   while (a < b && (s.charCodeAt(a) === 32 || s.charCodeAt(a) === 9)) a++;
   while (b > a && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
-  return s.slice(a, b);
+  return a === 0 && b === s.length ? s : s.slice(a, b);
 }
 
 // ------------------------------------------------------------ front matter
@@ -229,24 +240,24 @@ function parseFrontMatter(text) {
   let nl = text.indexOf('\n');
   if (text.slice(0, nl === -1 ? text.length : nl) !== '---') return { error: 'no front matter' };
   if (nl === -1) return { error: 'the front matter is not closed' };
-  const lines = [];
+  const data = {};
   let i = nl + 1;
+  let k = 0;
   let bodyStart = -1;
   for (;;) {
     const e = text.indexOf('\n', i);
     const end = e === -1 ? text.length : e;
-    if (text.slice(i, end) === '---') {
+    const line = text.slice(i, end);
+    if (line === '---') {
       bodyStart = e === -1 ? text.length : e + 1;
       break;
     }
-    lines.push(text.slice(i, end));
     if (e === -1) return { error: 'the front matter is not closed' };
     i = e + 1;
-  }
-  const data = {};
-  for (let k = 0; k < lines.length; k++) {
-    const line = lines[k];
-    if (isBlank(line) || line.charCodeAt(0) === 35) continue;
+    if (isBlank(line) || line.charCodeAt(0) === 35) {
+      k++;
+      continue;
+    }
     let j = 0;
     while (j < line.length) {
       const c = line.charCodeAt(j);
@@ -268,6 +279,7 @@ function parseFrontMatter(text) {
     const v = fmValue(key, raw);
     if ('error' in v) return v;
     data[key] = v.value;
+    k++;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
   return { data, body: text.slice(bodyStart) };
@@ -354,15 +366,51 @@ function matchOrdered(line) {
   return { start: Number(line.slice(0, j)), text: line.slice(j + 2) };
 }
 
+/** Whether `line` is a heading: the same test as matchHeading, without slicing its text. */
+function isHeadingLine(line) {
+  let d = 0;
+  while (d < line.length && line.charCodeAt(d) === 35) d++;
+  if (d === 0 || d > 6 || d >= line.length) return false;
+  const c = line.charCodeAt(d);
+  if (c !== 32 && c !== 9) return false;
+  let j = d;
+  while (j < line.length && (line.charCodeAt(j) === 32 || line.charCodeAt(j) === 9)) j++;
+  return j < line.length;
+}
+
+/** Whether `line` opens a fence: the same test as matchFenceOpen, without slicing its language. */
+function isFenceLine(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  let j = 3;
+  while (j < line.length) {
+    const c = line.charCodeAt(j);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) j++;
+    else break;
+  }
+  while (j < line.length) {
+    const c = line.charCodeAt(j);
+    if (c !== 32 && c !== 9) return false;
+    j++;
+  }
+  return true;
+}
+
 /** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
 function endsParagraph(line) {
-  return isBlank(line) || matchFenceOpen(line) !== null || matchHeading(line) !== null || isHR(line);
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) return isBlank(line);
+  if (c0 === 96) return isFenceLine(line);
+  if (c0 === 35) return isHeadingLine(line);
+  if (c0 === 45 || c0 === 42) return isHR(line);
+  return false;
 }
 
 /**
  * The first index from `from` where `s` holds `what` outside a backslash
- * escape, or -1. A `what` is hidden when the run of backslashes right before
- * it (counted from `from`) is odd: the last one then swallows its first char.
+ * escape, or -1. A `what` is hidden
+ * when the run of backslashes right before it (counted from `from`) is odd:
+ * the last one then swallows its first char.
  */
 function findUnescaped(s, what, from) {
   let j = s.indexOf(what, from);
@@ -402,34 +450,44 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** The characters that open an inline construct: backslash, backtick, star, open bracket. */
-const SPECIAL_RE = /[\\`*\[]/g;
+/**
+ * The characters that open an inline construct or need HTML escaping, in one
+ * scan: the plain runs between matches then hold neither, so they are
+ * appended raw instead of being escaped in a second pass.
+ */
+const INLINE_RE = /[&<>"'\\`*\[]/g;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 function inline(s, env) {
   let out = '';
   let plain = 0;
-  SPECIAL_RE.lastIndex = 0;
+  INLINE_RE.lastIndex = 0;
   let m;
-  while ((m = SPECIAL_RE.exec(s)) !== null) {
+  while ((m = INLINE_RE.exec(s)) !== null) {
     const i = m.index;
     const c = m[0];
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
+      if (plain < i) out += s.slice(plain, i);
+      out += ESCAPES[c];
+      plain = i + 1;
+      continue;
+    }
     if (c === '\\') {
       if (i + 1 < s.length && s.charCodeAt(i + 1) < 128 && ESCAPABLE[s.charCodeAt(i + 1)] === 1) {
-        if (plain < i) out += esc(s.slice(plain, i));
+        if (plain < i) out += s.slice(plain, i);
         out += s[i + 1] === '>' ? '&gt;' : s[i + 1];
         plain = i + 2;
-        SPECIAL_RE.lastIndex = i + 2;
+        INLINE_RE.lastIndex = i + 2;
       }
       continue;
     }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        if (plain < i) out += esc(s.slice(plain, i));
+        if (plain < i) out += s.slice(plain, i);
         out += `<code>${esc(s.slice(i + 1, j))}</code>`;
         plain = j + 1;
-        SPECIAL_RE.lastIndex = j + 1;
+        INLINE_RE.lastIndex = j + 1;
       }
       continue;
     }
@@ -437,20 +495,20 @@ function inline(s, env) {
       if (s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          if (plain < i) out += esc(s.slice(plain, i));
+          if (plain < i) out += s.slice(plain, i);
           out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`;
           plain = j + 2;
-          SPECIAL_RE.lastIndex = j + 2;
+          INLINE_RE.lastIndex = j + 2;
         } else {
-          SPECIAL_RE.lastIndex = i + 2;
+          INLINE_RE.lastIndex = i + 2;
         }
       } else {
         const j = findSingleStar(s, i + 1);
         if (j > i + 1) {
-          if (plain < i) out += esc(s.slice(plain, i));
+          if (plain < i) out += s.slice(plain, i);
           out += `<em>${inline(s.slice(i + 1, j), env)}</em>`;
           plain = j + 1;
-          SPECIAL_RE.lastIndex = j + 1;
+          INLINE_RE.lastIndex = j + 1;
         }
       }
       continue;
@@ -459,13 +517,13 @@ function inline(s, env) {
     const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
     const target = mm === -1 ? '' : s.slice(k + 2, mm);
     if (target !== '' && !HAS_WS.test(target)) {
-      if (plain < i) out += esc(s.slice(plain, i));
+      if (plain < i) out += s.slice(plain, i);
       out += `<a href="${esc(env.link(target))}">${inline(s.slice(i + 1, k), env)}</a>`;
       plain = mm + 1;
-      SPECIAL_RE.lastIndex = mm + 1;
+      INLINE_RE.lastIndex = mm + 1;
     }
   }
-  if (plain < s.length) out += esc(s.slice(plain));
+  if (plain < s.length) out += s.slice(plain);
   return out;
 }
 
@@ -479,16 +537,23 @@ function renderMarkdown(src, env, slugify) {
   const ids = new Set();
   const toc = [];
   let excerpt = null;
+  // Every line's words are counted exactly once in the per-line loop, and a
+  // blank line holds none, so one pass over the whole body gives the same
+  // total without a call per line.
+  const wc = countWords(src);
   const blocks = [];
   let i = 0;
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (isBlank(line)) {
+    const c0 = line.length === 0 ? -1 : line.charCodeAt(0);
+    if (c0 === -1 || ((c0 === 32 || c0 === 9) && isBlank(line))) {
       i++;
       continue;
     }
-    const lang = matchFenceOpen(line);
+    // A block's kind follows its first character: a fence, a heading and a
+    // thematic break each open on one, so only that one's test runs.
+    const lang = c0 === 96 ? matchFenceOpen(line) : null;
     if (lang !== null) {
       let body = '';
       i++;
@@ -501,7 +566,7 @@ function renderMarkdown(src, env, slugify) {
       blocks.push(`<pre><code${cls}>${body}</code></pre>\n`);
       continue;
     }
-    const hd = matchHeading(line);
+    const hd = c0 === 35 ? matchHeading(line) : null;
     if (hd !== null) {
       const id = uniqueSlug(slugify(hd.text), ids);
       const html = inline(hd.text, env);
@@ -510,12 +575,12 @@ function renderMarkdown(src, env, slugify) {
       i++;
       continue;
     }
-    if (isHR(line)) {
+    if ((c0 === 45 || c0 === 42) && isHR(line)) {
       blocks.push('<hr>\n');
       i++;
       continue;
     }
-    if (line.charCodeAt(0) === 62) {
+    if (c0 === 62) {
       const qlines = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         const l = lines[i];
@@ -526,8 +591,8 @@ function renderMarkdown(src, env, slugify) {
       blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(kept.join('\n'), env)}</p>\n</blockquote>\n`);
       continue;
     }
-    const bullet = matchBullet(line);
-    const ordered = bullet === null ? matchOrdered(line) : null;
+    const bullet = c0 === 45 || c0 === 42 ? matchBullet(line) : null;
+    const ordered = bullet === null && c0 >= 48 && c0 <= 57 ? matchOrdered(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const items = [];
@@ -561,7 +626,7 @@ function renderMarkdown(src, env, slugify) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>\n`);
   }
-  return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.join(''), toc, excerpt: excerpt ?? '', wc };
 }
 
 // ---------------------------------------------------------------- templates
@@ -855,7 +920,7 @@ function cardOf(s) {
     date_long: s.data.date === undefined ? '' : longDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+    reading_minutes: Math.max(1, Math.ceil(s.wordCount / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
   };
 }
@@ -967,28 +1032,49 @@ export function run(input) {
   }
 
   // 4. Each body's Markdown, its links resolved to the pages and static files
-  // they name.
+  // they name. Link targets repeat across the sources of a directory, so a
+  // per-case cache holds each (directory, target) resolution; a cached broken
+  // link still records this source's line in the report.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
+  const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    let dirCache = linkCache.get(dir);
+    if (dirCache === undefined) {
+      dirCache = new Map();
+      linkCache.set(dir, dirCache);
+    }
     const env = {
       link: (target) => {
         if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
+        const hit = dirCache.get(target);
+        if (hit !== undefined) {
+          if (hit.broken) broken.add(`broken-link ${s.path} -> ${target}`);
+          return hit.href;
+        }
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
         const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
-        broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
+        let href;
+        let isBroken = false;
+        if (path !== null && bySource.has(path)) href = `${bySource.get(path).url}${frag}`;
+        else if (path !== null && staticPaths.has(path)) href = `${base}/${path}${frag}`;
+        else {
+          broken.add(`broken-link ${s.path} -> ${target}`);
+          href = target;
+          isBroken = true;
+        }
+        dirCache.set(target, { href, broken: isBroken });
+        return href;
       },
     };
     const md = renderMarkdown(s.body, env, slugify);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.wordCount = md.wc;
   }
 
   // 5. The posts, newest first and then by slug; each post's newer and older neighbours.
